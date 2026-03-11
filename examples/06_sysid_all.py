@@ -19,10 +19,12 @@ import time
 parser = argparse.ArgumentParser(
     description="This script demonstrates adding a custom robot to an Isaac Lab environment."
 )
-parser.add_argument("--num_envs", type=int, default=1, help="Number of environments to spawn.")
+parser.add_argument("--num_envs", type=int, default=8192, help="Number of environments to spawn.")
 parser.add_argument("--gripper", action="store_true", help="Use gripper")
+parser.add_argument("--fr3_robotiq", action="store_true", help="Use FR3+Robotiq custom USD instead of FR3")
 parser.add_argument("--name", type=str, default="test", help="Name of the experiment")
-parser.add_argument("--dir", type=str, default=".", help="Directory for results")
+parser.add_argument("--data_dir", type=str, required=True, help="Directory containing sysid_K*_D*.npz files")
+parser.add_argument("--output_dir", type=str, default="final_grid", help="Directory for output results")
 # append AppLauncher cli args
 AppLauncher.add_app_launcher_args(parser)
 # parse the arguments
@@ -228,8 +230,128 @@ FRANKA_FR3_CFG = ArticulationCfg(
 soft_joint_pos_limit_factor=1.0,
 )
 
-"""Configuration of Franka Emika Panda robot."""
+"""Configuration of Franka Emika FR3 robot."""
 
+
+FR3_ROBOTIQ_USD = os.path.join(
+    os.path.dirname(__file__), "..", "..", "isaaclab_learnability", "source",
+    "isaaclab_learnability", "isaaclab_learnability", "assets", "robots", "fr3_robotiq", "fr3_robotiq.usd",
+)
+FR3_ROBOTIQ_USD = os.path.normpath(FR3_ROBOTIQ_USD)
+
+FR3_ROBOTIQ_CFG = ArticulationCfg(
+    spawn=sim_utils.UsdFileCfg(
+        usd_path=FR3_ROBOTIQ_USD,
+        activate_contact_sensors=False,
+        rigid_props=sim_utils.RigidBodyPropertiesCfg(
+            disable_gravity=True,
+            max_depenetration_velocity=5.0,
+        ),
+        articulation_props=sim_utils.ArticulationRootPropertiesCfg(
+            enabled_self_collisions=False, solver_position_iteration_count=12, solver_velocity_iteration_count=1
+        ),
+    ),
+    init_state=ArticulationCfg.InitialStateCfg(
+        joint_pos={
+            "fr3_joint1": 0.0,
+            "fr3_joint2": 0.0,
+            "fr3_joint3": 0.0,
+            "fr3_joint4": -1.5707899999999999,
+            "fr3_joint5": 0.0,
+            "fr3_joint6": 1.5707899999999999,
+            "fr3_joint7": -0.7853,
+            "finger_joint": 0.0,
+            ".*_inner_finger_joint": 0.0,
+            ".*_inner_finger_knuckle_joint": 0.0,
+            ".*_outer_.*_joint": 0.0,
+        },
+    ),
+    actuators={
+        "fr3_joint1": ImplicitActuatorCfg(
+            joint_names_expr=["fr3_joint1"],
+            effort_limit_sim=87.0,
+            velocity_limit_sim=1000.0,
+            stiffness=80,
+            damping=4,
+        ),
+        "fr3_joint2": ImplicitActuatorCfg(
+            joint_names_expr=["fr3_joint2"],
+            effort_limit_sim=87.0,
+            velocity_limit_sim=1000.0,
+            stiffness=80,
+            damping=4,
+        ),
+        "fr3_joint3": ImplicitActuatorCfg(
+            joint_names_expr=["fr3_joint3"],
+            effort_limit_sim=87.0,
+            velocity_limit_sim=1000.0,
+            stiffness=80,
+            damping=4,
+        ),
+        "fr3_joint4": ImplicitActuatorCfg(
+            joint_names_expr=["fr3_joint4"],
+            effort_limit_sim=87.0,
+            velocity_limit_sim=1000.0,
+            stiffness=80,
+            damping=4,
+        ),
+        "fr3_joint5": ImplicitActuatorCfg(
+            joint_names_expr=["fr3_joint5"],
+            effort_limit_sim=12.0,
+            velocity_limit_sim=1000.0,
+            stiffness=80,
+            damping=4,
+        ),
+        "fr3_joint6": ImplicitActuatorCfg(
+            joint_names_expr=["fr3_joint6"],
+            effort_limit_sim=12.0,
+            velocity_limit_sim=1000.0,
+            stiffness=80,
+            damping=4,
+        ),
+        "fr3_joint7": ImplicitActuatorCfg(
+            joint_names_expr=["fr3_joint7"],
+            effort_limit_sim=12.0,
+            velocity_limit_sim=1000.0,
+            stiffness=80,
+            damping=4,
+        ),
+        "gripper_drive": ImplicitActuatorCfg(
+            joint_names_expr=["finger_joint"],
+            effort_limit_sim=1650,
+            velocity_limit_sim=10.0,
+            stiffness=17,
+            damping=0.02,
+        ),
+        "gripper_finger": ImplicitActuatorCfg(
+            joint_names_expr=[".*_inner_finger_joint"],
+            effort_limit_sim=1650,
+            velocity_limit_sim=10.0,
+            stiffness=0.0,
+            damping=0.0,
+        ),
+        "gripper_knuckle": ImplicitActuatorCfg(
+            joint_names_expr=[".*_inner_finger_knuckle_joint"],
+            effort_limit_sim=1650,
+            velocity_limit_sim=10.0,
+            stiffness=0.0,
+            damping=0.0,
+        ),
+        "gripper_outer": ImplicitActuatorCfg(
+            joint_names_expr=[".*_outer_.*_joint"],
+            effort_limit_sim=1650,
+            velocity_limit_sim=10.0,
+            stiffness=0.0,
+            damping=0.0,
+        ),
+    },
+    soft_joint_pos_limit_factor=1.0,
+)
+
+"""Configuration of FR3+Robotiq robot (custom USD)."""
+
+
+_ROBOT_CFG = FR3_ROBOTIQ_CFG if args_cli.fr3_robotiq else FRANKA_FR3_CFG
 
 
 class NewRobotsSceneCfg(InteractiveSceneCfg):
@@ -244,7 +366,7 @@ class NewRobotsSceneCfg(InteractiveSceneCfg):
     )
 
     # robot
-    Franka = FRANKA_FR3_CFG.replace(prim_path="{ENV_REGEX_NS}/Franka")
+    Franka = _ROBOT_CFG.replace(prim_path="{ENV_REGEX_NS}/Franka")
 
 
 
@@ -260,22 +382,26 @@ def run_simulator(name, sim: sim_utils.SimulationContext, scene: InteractiveScen
     lower = np.array([-2.7437, -1.7837, -2.9007, -3.0421, -2.8065, 0.5445, -3.0519])
     upper = np.array([+2.7437, +1.7837, +2.9007, +0.1518, +2.8065, +4.5169, +3.0519])
 
+    # Total number of joints in the USD (9 for FR3, 13 for Panda+Robotiq)
+    total_joint_num = scene["Franka"].num_joints
+
     # name = args_cli.name
 
-    os.makedirs(f"final_grid/{name}", exist_ok=True)
+    os.makedirs(f"{args_cli.output_dir}/{name}", exist_ok=True)
 
-    real_data = np.load(f"examples/sysid_left_more/sysid_{name}.npz")
+    real_data = np.load(f"{args_cli.data_dir}/sysid_{name}.npz")
     # print(real_+d)
     real_data = {k: v for k, v in real_data.items()}
     print(real_data.keys())
 
 
-    joint_pos = np.zeros(9)
+    joint_pos = np.zeros(total_joint_num)
     joint_pos[:7] = real_data["qpos"][0, :7] #+ np.random.uniform(-1, 1, 7)
     joint_pos[:7] = np.clip(joint_pos[:7], lower, upper)
-    joint_pos[7] = 0.04
-    joint_pos[8] = 0.04
-    joint_vel = np.zeros(9)
+    if not args_cli.fr3_robotiq:
+        joint_pos[7] = 0.04
+        joint_pos[8] = 0.04
+    joint_vel = np.zeros(total_joint_num)
 
     torch_joint_pos = torch.from_numpy(joint_pos).to(torch.float32).to(args_cli.device).unsqueeze(0)
     torch_joint_vel = torch.from_numpy(joint_vel).to(torch.float32).to(args_cli.device).unsqueeze(0)
@@ -288,7 +414,7 @@ def run_simulator(name, sim: sim_utils.SimulationContext, scene: InteractiveScen
     else:
         joint_num = 7
 
-    body_num = 11
+    body_num = scene["Franka"].num_bodies
 
     bounds = np.zeros((6 * joint_num, 2))
     bounds[:, 0] = 0
@@ -312,7 +438,8 @@ def run_simulator(name, sim: sim_utils.SimulationContext, scene: InteractiveScen
 
     plots = []
 
-    real_data["qpos"][:, 7:9] *= 0.5
+    if not args_cli.fr3_robotiq:
+        real_data["qpos"][:, 7:9] *= 0.5
 
     lowest_loss = 1e6
 
@@ -357,10 +484,11 @@ def run_simulator(name, sim: sim_utils.SimulationContext, scene: InteractiveScen
         costs = np.zeros(args_cli.num_envs)
 
 
-        joint_pos = np.zeros(9)
+        joint_pos = np.zeros(total_joint_num)
         joint_pos[:7] = real_data["qpos"][0, :7] #+ np.random.uniform(-1, 1, 7)
-        joint_pos[7:9] = 0.04
-        joint_vel = np.zeros(9)
+        if not args_cli.fr3_robotiq:
+            joint_pos[7:9] = 0.04
+        joint_vel = np.zeros(total_joint_num)
 
         torch_joint_pos = torch.from_numpy(joint_pos).to(torch.float32).to(args_cli.device).unsqueeze(0)
         torch_joint_vel = torch.from_numpy(joint_vel).to(torch.float32).to(args_cli.device).unsqueeze(0)
@@ -378,11 +506,10 @@ def run_simulator(name, sim: sim_utils.SimulationContext, scene: InteractiveScen
         for count in range(real_data["qpos"].shape[0]):
 
             # wave
-            wave_action = torch.zeros(args_cli.num_envs, 9)
+            wave_action = torch.zeros(args_cli.num_envs, total_joint_num)
             wave_action[:, :7] = torch.from_numpy(real_data["qdes"][count][:7]).to(args_cli.device).unsqueeze(0)
-            wave_action[:, 7:9] = 0.04
-            # wave_action[:, 7] = 0.04 #.04
-            # wave_action[:, 8] = 0.04 #.04
+            if not args_cli.fr3_robotiq:
+                wave_action[:, 7:9] = 0.04
 
             # wave_action[:, 0:7] += magnitude * np.sin(2 * np.pi * frequency * (sim_time - reset_sim_time))
             # wave_action[:, 0:7] += noise_magnitude * torch.randn_like(wave_action[:, 0:7])
@@ -518,7 +645,7 @@ def run_simulator(name, sim: sim_utils.SimulationContext, scene: InteractiveScen
 
         if min_cost < lowest_loss:
             lowest_loss = min_cost
-            with open(f"final_grid/{name}/best_seed{rand_run_int}.json", "w") as f:
+            with open(f"{args_cli.output_dir}/{name}/best_seed{rand_run_int}.json", "w") as f:
                 json.dump(info, f, indent=4)
 
         min_pd_gain = pd_gains_cost[argidx][0]
@@ -541,7 +668,7 @@ def run_simulator(name, sim: sim_utils.SimulationContext, scene: InteractiveScen
             # update the mean and sigma
             plots.append(plot)
 
-            imageio.mimsave(f'final_grid/{name}/plots.mp4', plots, fps=10)
+            imageio.mimsave(f'{args_cli.output_dir}/{name}/plots.mp4', plots, fps=10)
         
         t_plot = time.time() - t_plot
         
@@ -604,7 +731,7 @@ def draw_real_plot(name, cost, generation, joint_positions, joint_targets, real_
     plt.figtext(0.5, 0.06, viscous_friction_txt, ha='center', fontsize=12)
     plt.legend()
     axs[0].set_title(f"Generation {generation} | Cost: {cost:.5f}")
-    plt.savefig(f"final_grid/{name}/plot.png", dpi=300, bbox_inches='tight', pad_inches=0.1)
+    plt.savefig(f"{args_cli.output_dir}/{name}/plot.png", dpi=300, bbox_inches='tight', pad_inches=0.1)
 
     # tight layout
     plt.tight_layout()
@@ -632,7 +759,8 @@ def main():
     # Run the simulator
 
     # kps = [ 16, 32, 64, 128, 256, 512 ]
-    kps = [ 16, 32, 64, 128, 160, 256, 512 ]
+    # kps = [ 16, 32, 64, 128, 160, 256, 512 ]
+    kps = [ 32, 64, 128, 160, 256, 512 ]
     kds = [ 1, 2, 4, 8, 12, 16, 24 ]
 
     for kp in kps:
