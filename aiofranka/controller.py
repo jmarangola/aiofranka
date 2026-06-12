@@ -110,7 +110,14 @@ class FrankaController:
         """
         self.robot = robot
 
-        self.initialize() 
+        # Canonical gripper-down EE rotation (world frame) for "osc_flat":
+        # EE x along world +x, EE z pointing straight down. Override before
+        # switch("osc_flat") if your rig's yaw-zero convention differs.
+        self.R_down = np.array([[1.0, 0.0, 0.0],
+                                [0.0, -1.0, 0.0],
+                                [0.0, 0.0, -1.0]])
+
+        self.initialize()
         self.state_lock = threading.Lock()
 
         self.type = "impedance"
@@ -178,6 +185,31 @@ class FrankaController:
 
         self.q_desired= self.initial_qpos
         self.ee_desired = self.initial_ee
+        self.xyzyaw_desired = self._pose_to_xyzyaw(self.initial_ee)
+
+    @staticmethod
+    def _swing_twist_z(rot):
+        """Split a rotation into tilt about world x/y (swing) and yaw about world z (twist).
+
+        Returns [tilt_x, tilt_y, yaw] such that rot == swing * Rz(yaw), with the
+        swing axis in the world xy-plane. Lets per-axis gains act on tilt and yaw
+        independently.
+        """
+        qx, qy, qz, qw = rot.as_quat()
+        if qw < 0:
+            qx, qy, qz, qw = -qx, -qy, -qz, -qw
+        if np.hypot(qz, qw) < 1e-8:
+            # 180-degree tilt: yaw is undefined, fall back to the raw rotvec
+            return rot.as_rotvec()
+        twist = R.from_quat([0.0, 0.0, qz, qw])
+        out = (rot * twist.inv()).as_rotvec()
+        out[2] = 2.0 * np.arctan2(qz, qw)
+        return out
+
+    def _pose_to_xyzyaw(self, ee):
+        """Project a world-frame EE pose onto (x, y, z, yaw about world z) wrt R_down."""
+        yaw = self._swing_twist_z(R.from_matrix(ee[:3, :3] @ self.R_down.T))[2]
+        return np.array([ee[0, 3], ee[1, 3], ee[2, 3], yaw])
 
     def _update_desired(self, desired):
         """
@@ -235,10 +267,12 @@ class FrankaController:
             attr (str): Attribute name to set. Common values:
                        - "q_desired": Joint position target (impedance mode)
                        - "ee_desired": End-effector pose target (OSC mode)
+                       - "xyzyaw_desired": EE position + yaw target (osc_flat mode)
                        - "torque": Direct torque command (torque mode)
             value: Value to set. Type depends on attr:
                   - q_desired: np.ndarray (7,) [rad]
                   - ee_desired: np.ndarray (4, 4) homogeneous transform
+                  - xyzyaw_desired: np.ndarray (4,) [m, m, m, rad] (world-frame yaw)
                   - torque: np.ndarray (7,) [Nm]
                   
         Note:
@@ -439,6 +473,8 @@ class FrankaController:
                 - "impedance": Joint-space impedance control
                 - "pid": Joint-space PID control with integral term
                 - "osc": Operational space control (task space)
+                - "osc_flat": OSC with gripper-down orientation; target is
+                  (x, y, z, yaw) via "xyzyaw_desired" (non-prehensile tasks)
                 - "torque": Direct torque control
                 
         Example:
@@ -482,6 +518,8 @@ class FrankaController:
             self._pid_step(self.state)
         elif self.type == "osc":
             self._osc_step(self.state)
+        elif self.type == "osc_flat":
+            self._osc_flat_step(self.state)
         elif self.type == "torque":
             self._torque_step(self.state)
         else:
@@ -491,15 +529,9 @@ class FrankaController:
 
         self.robot.step(self.torque)
 
-    def _osc_step(self, state): 
+    def _osc_step(self, state):
 
-        jac = state['jac']
         ee = state['ee']
-        q = state['qpos']
-        dq = state['qvel']
-        mm = state['mm']
-        last_torque = state['last_torque']
-
 
         with self.state_lock:
             ee_goal = self.ee_desired
@@ -512,6 +544,48 @@ class FrankaController:
         twist = np.zeros(6)
         twist[:3] = position_error
         twist[3:] = rotation_error_vec
+        self._osc_servo(state, twist)
+
+    def _osc_flat_step(self, state):
+        """OSC with the gripper-down orientation as part of the primary task.
+
+        Target is xyzyaw_desired = (x, y, z, yaw): position plus yaw about the
+        world z axis; the desired rotation is Rz(yaw) @ R_down. Per-axis ee_kp
+        maps onto [x, y, z, tilt_x, tilt_y, yaw]: stiff x/y to track policy
+        setpoints against contact friction, soft z so height error stays
+        compliant instead of becoming table normal force, stiff tilt to hold the
+        gripper pointing down, and an independent yaw gain via the swing-twist
+        split.
+
+        Example:
+            >>> controller.switch("osc_flat")
+            >>> controller.ee_kp = np.array([400, 400, 40, 150, 150, 50])
+            >>> controller.ee_kd = 2 * np.sqrt(controller.ee_kp)
+            >>> await controller.set("xyzyaw_desired", np.array([0.5, 0.0, 0.12, 0.0]))
+        """
+        ee = state['ee']
+
+        with self.state_lock:
+            xyzyaw = np.array(self.xyzyaw_desired, dtype=float)
+
+        goal_rot = R.from_euler('z', xyzyaw[3]).as_matrix() @ self.R_down
+        position_error = xyzyaw[:3] - ee[:3, 3]
+        rotation_error = R.from_matrix(goal_rot) * R.from_matrix(ee[:3, :3]).inv()
+
+        twist = np.zeros(6)
+        twist[:3] = position_error
+        twist[3:] = self._swing_twist_z(rotation_error)
+        self._osc_servo(state, twist)
+
+    def _osc_servo(self, state, twist):
+        """Map a world-frame task-space error twist to torques (shared OSC tail)."""
+
+        jac = state['jac']
+        q = state['qpos']
+        dq = state['qvel']
+        mm = state['mm']
+        last_torque = state['last_torque']
+
         ee_vel = jac @ dq
         # minv = np.linalg.inv(mm)
         if abs(np.linalg.det(mm)) > 1e-2:
