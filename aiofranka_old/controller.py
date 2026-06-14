@@ -110,26 +110,13 @@ class FrankaController:
         """
         self.robot = robot
 
-        # Canonical gripper-down EE rotation (world frame) for "osc_flat":
-        # EE x along world +x, EE z pointing straight down. Override before
-        # switch("osc_flat") if your rig's yaw-zero convention differs.
-        self.R_down = np.array([[1.0, 0.0, 0.0],
-                                [0.0, -1.0, 0.0],
-                                [0.0, 0.0, -1.0]])
-
-        # Control-loop bookkeeping must exist before initialize(), which calls
-        # _read_state() and inspects self._thread / self.state.
-        self.running = False
-        self.task = None
-        self._thread = None
-        self._loop_error = None
-        self.state = None
-
-        self.initialize()
+        self.initialize() 
         self.state_lock = threading.Lock()
 
         self.type = "impedance"
-        self.clip = True
+        self.running = False
+        self.task = None
+        self.clip = True 
 
 
         self.kp, self.kd = np.ones(7) * 80, np.ones(7) * 4
@@ -147,6 +134,8 @@ class FrankaController:
         self._update_freq = 50.0  # Default 50Hz
         self._last_update_time = {}
         self._pending_updates = {}
+
+        self.state = None 
 
         self.verbose = False
 
@@ -179,56 +168,16 @@ class FrankaController:
         await asyncio.sleep(5)
         self.track = False
 
-    def _read_state(self):
-        """Snapshot of robot state that is safe to read off the control thread.
-
-        libfranka's readOnce/writeOnce are not safe to call concurrently on one control
-        handle. Once the real-robot control thread is running it owns that handle, so
-        callers like initialize()/move() must use the state it caches each tick
-        (self.state) instead of hitting self.robot.state (another readOnce) directly.
-        Before the loop starts (or in sim, where there is no separate thread) read the
-        robot directly.
-        """
-        if (self.robot.real and self._thread is not None
-                and self._thread.is_alive() and self.state is not None):
-            return self.state
-        return self.robot.state
-
-    def initialize(self):
+    def initialize(self): 
 
         # Get initial state
-        initial_state = self._read_state()
+        initial_state = self.robot.state
         self.initial_ee = initial_state['ee']
         self.initial_qpos = deepcopy(initial_state['qpos'])
         self.initial_qvel = deepcopy(initial_state['qvel'])
 
         self.q_desired= self.initial_qpos
         self.ee_desired = self.initial_ee
-        self.xyzyaw_desired = self._pose_to_xyzyaw(self.initial_ee)
-
-    @staticmethod
-    def _swing_twist_z(rot):
-        """Split a rotation into tilt about world x/y (swing) and yaw about world z (twist).
-
-        Returns [tilt_x, tilt_y, yaw] such that rot == swing * Rz(yaw), with the
-        swing axis in the world xy-plane. Lets per-axis gains act on tilt and yaw
-        independently.
-        """
-        qx, qy, qz, qw = rot.as_quat()
-        if qw < 0:
-            qx, qy, qz, qw = -qx, -qy, -qz, -qw
-        if np.hypot(qz, qw) < 1e-8:
-            # 180-degree tilt: yaw is undefined, fall back to the raw rotvec
-            return rot.as_rotvec()
-        twist = R.from_quat([0.0, 0.0, qz, qw])
-        out = (rot * twist.inv()).as_rotvec()
-        out[2] = 2.0 * np.arctan2(qz, qw)
-        return out
-
-    def _pose_to_xyzyaw(self, ee):
-        """Project a world-frame EE pose onto (x, y, z, yaw about world z) wrt R_down."""
-        yaw = self._swing_twist_z(R.from_matrix(ee[:3, :3] @ self.R_down.T))[2]
-        return np.array([ee[0, 3], ee[1, 3], ee[2, 3], yaw])
 
     def _update_desired(self, desired):
         """
@@ -286,12 +235,10 @@ class FrankaController:
             attr (str): Attribute name to set. Common values:
                        - "q_desired": Joint position target (impedance mode)
                        - "ee_desired": End-effector pose target (OSC mode)
-                       - "xyzyaw_desired": EE position + yaw target (osc_flat mode)
                        - "torque": Direct torque command (torque mode)
             value: Value to set. Type depends on attr:
                   - q_desired: np.ndarray (7,) [rad]
                   - ee_desired: np.ndarray (4, 4) homogeneous transform
-                  - xyzyaw_desired: np.ndarray (4,) [m, m, m, rad] (world-frame yaw)
                   - torque: np.ndarray (7,) [Nm]
                   
         Note:
@@ -403,69 +350,9 @@ class FrankaController:
             #     # print what axis is causing the issue
             #     arg_idxs = np.where(diff > 1000.)[0]
             #     print(f"High torque rate of change detected on axes: {arg_idxs}")
-            #     print((self.torque - self.last_torque)/1e-3)
+            #     print((self.torque - self.last_torque)/1e-3) 
             sys.exit(1)  # Kill the entire script
-
-    def _run_blocking(self):
-        """Synchronous 1kHz control loop for the real robot, run in a dedicated OS thread.
-
-        Driving libfranka from the asyncio event loop is fragile: any other coroutine
-        (ZMQ handling, prints, the spacemouse) or a GC pause stalls the loop past the
-        FCI tolerance and trips ["communication_constraints_violation"]. Run here, the
-        loop is paced only by readOnce() inside step() -- which blocks ~1ms releasing the
-        GIL -- and is isolated from whatever the event loop is doing. GC is disabled so a
-        collection pause can't blow the 1ms deadline; the loop only allocates short-lived
-        numpy arrays, which CPython reclaims by refcount (no cycles), so memory is bounded.
-
-        Unlike _run() this never sys.exit()s: a thread can't kill the process that way.
-        On error it records self._loop_error and drops out; callers poll .alive to react.
-        """
-        import gc
-
-        gc_was_enabled = gc.isenabled()
-        gc.disable()
-
-        loop_times = []
-        last_time = time.perf_counter()
-        log_interval = 1000
-        iteration = 0
-        try:
-            while self.running:
-                self.step()
-
-                if self.track:
-                    current_time = time.perf_counter()
-                    loop_times.append(current_time - last_time)
-                    last_time = current_time
-                    iteration += 1
-                    if iteration % log_interval == 0:
-                        a = np.array(loop_times)
-                        print(f"Control loop stats (last {log_interval} iterations):")
-                        print(f"  Frequency: {1.0 / np.mean(a):.1f} Hz (target: 1000 Hz)")
-                        print(f"  Mean dt: {np.mean(a) * 1000:.3f} ms, Std: {np.std(a) * 1000:.3f} ms")
-                        print(f"  Min dt: {np.min(a) * 1000:.3f} ms, Max dt: {np.max(a) * 1000:.3f} ms")
-                        print(f"  Jitter (max-min): {(np.max(a) - np.min(a)) * 1000:.3f} ms")
-                        loop_times.clear()
-        except Exception as e:
-            self._loop_error = e
-            print(f"Error in control loop: {e}")
-        finally:
-            self.running = False
-            if gc_was_enabled:
-                gc.enable()
-
-    @property
-    def alive(self):
-        """True while the control loop is running without a fatal error.
-
-        For the real robot this tracks the dedicated control thread; for sim it follows
-        the asyncio loop's running flag. Servers poll this to detect a reflex abort and
-        shut down cleanly instead of silently accepting commands the robot won't execute.
-        """
-        if self.robot.real:
-            return self.running and self._thread is not None and self._thread.is_alive()
-        return self.running
-
+    
     async def start(self):
         """
         Start the 1kHz background control loop.
@@ -499,21 +386,10 @@ class FrankaController:
 
         print("starting robot!")
         self.robot.start()
-        self._loop_error = None
-        self.running = True
 
-        if self.robot.real:
-            # Real robot: run the 1kHz loop in a dedicated OS thread so the event loop
-            # (ZMQ, prints, etc.) can't starve it and trip a reflex abort.
-            if self._thread is None or not self._thread.is_alive():
-                self._thread = threading.Thread(target=self._run_blocking, daemon=True)
-                self._thread.start()
-        else:
-            # Sim: keep the cooperative asyncio loop (no hard real-time requirement,
-            # and the MuJoCo viewer is driven from this task).
-            if self.task is None or self.task.done():
-                self.task = asyncio.create_task(self._run())
-        await asyncio.sleep(1)  # Yield to ensure the loop starts
+        if self.task is None or self.task.done():
+            self.task = asyncio.create_task(self._run())
+        await asyncio.sleep(1)  # Yield to ensure the task starts
         return self.task
     
     async def stop(self):
@@ -539,20 +415,16 @@ class FrankaController:
             will briefly hold position then release brakes.
         """
         self.running = False
-        if self.robot.real:
-            if self._thread:
-                self._thread.join(timeout=2.0)
-                self._thread = None
-        elif self.task:
+        if self.task:
             self.task.cancel()
             try:
                 await self.task
             except asyncio.CancelledError:
-                print("Control loop task cancelled.")
+                print("Control loop task cancelled.") 
 
         self.robot.stop()
         print("robot stopped")
-        await asyncio.sleep(1)  # Yield to ensure the loop stops
+        await asyncio.sleep(1)  # Yield to ensure the task starts
 
     def switch(self, controller_type: str):
         """
@@ -567,8 +439,6 @@ class FrankaController:
                 - "impedance": Joint-space impedance control
                 - "pid": Joint-space PID control with integral term
                 - "osc": Operational space control (task space)
-                - "osc_flat": OSC with gripper-down orientation; target is
-                  (x, y, z, yaw) via "xyzyaw_desired" (non-prehensile tasks)
                 - "torque": Direct torque control
                 
         Example:
@@ -612,8 +482,6 @@ class FrankaController:
             self._pid_step(self.state)
         elif self.type == "osc":
             self._osc_step(self.state)
-        elif self.type == "osc_flat":
-            self._osc_flat_step(self.state)
         elif self.type == "torque":
             self._torque_step(self.state)
         else:
@@ -623,9 +491,15 @@ class FrankaController:
 
         self.robot.step(self.torque)
 
-    def _osc_step(self, state):
+    def _osc_step(self, state): 
 
+        jac = state['jac']
         ee = state['ee']
+        q = state['qpos']
+        dq = state['qvel']
+        mm = state['mm']
+        last_torque = state['last_torque']
+
 
         with self.state_lock:
             ee_goal = self.ee_desired
@@ -638,48 +512,6 @@ class FrankaController:
         twist = np.zeros(6)
         twist[:3] = position_error
         twist[3:] = rotation_error_vec
-        self._osc_servo(state, twist)
-
-    def _osc_flat_step(self, state):
-        """OSC with the gripper-down orientation as part of the primary task.
-
-        Target is xyzyaw_desired = (x, y, z, yaw): position plus yaw about the
-        world z axis; the desired rotation is Rz(yaw) @ R_down. Per-axis ee_kp
-        maps onto [x, y, z, tilt_x, tilt_y, yaw]: stiff x/y to track policy
-        setpoints against contact friction, soft z so height error stays
-        compliant instead of becoming table normal force, stiff tilt to hold the
-        gripper pointing down, and an independent yaw gain via the swing-twist
-        split.
-
-        Example:
-            >>> controller.switch("osc_flat")
-            >>> controller.ee_kp = np.array([400, 400, 40, 150, 150, 50])
-            >>> controller.ee_kd = 2 * np.sqrt(controller.ee_kp)
-            >>> await controller.set("xyzyaw_desired", np.array([0.5, 0.0, 0.12, 0.0]))
-        """
-        ee = state['ee']
-
-        with self.state_lock:
-            xyzyaw = np.array(self.xyzyaw_desired, dtype=float)
-
-        goal_rot = R.from_euler('z', xyzyaw[3]).as_matrix() @ self.R_down
-        position_error = xyzyaw[:3] - ee[:3, 3]
-        rotation_error = R.from_matrix(goal_rot) * R.from_matrix(ee[:3, :3]).inv()
-
-        twist = np.zeros(6)
-        twist[:3] = position_error
-        twist[3:] = self._swing_twist_z(rotation_error)
-        self._osc_servo(state, twist)
-
-    def _osc_servo(self, state, twist):
-        """Map a world-frame task-space error twist to torques (shared OSC tail)."""
-
-        jac = state['jac']
-        q = state['qpos']
-        dq = state['qvel']
-        mm = state['mm']
-        last_torque = state['last_torque']
-
         ee_vel = jac @ dq
         # minv = np.linalg.inv(mm)
         if abs(np.linalg.det(mm)) > 1e-2:
@@ -844,9 +676,11 @@ class FrankaController:
         inp = InputParameter(7)
 
         print('getting current state for ruckig...')
-        move_state = self._read_state()
-        inp.current_position = move_state['qpos']
-        inp.current_velocity = move_state['qvel']
+        # IMPORTANT: Use cached self.state instead of self.robot.state
+        # self.robot.state triggers a blocking readOnce() call that interferes
+        # with the 1kHz control loop timing, causing communication_constraints_violation
+        inp.current_position = self.state['qpos'].copy()
+        inp.current_velocity = self.state['qvel'].copy()
         print("got current state")
         inp.current_acceleration = np.zeros(7)
 
